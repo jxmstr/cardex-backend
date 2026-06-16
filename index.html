@@ -3,12 +3,46 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5"/>
-<title>Cardex BUILD-1781622871</title>
+<title>Cardex</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script>
+/* Robust loader: load React, ReactDOM, Babel; if unpkg fails, fall back to jsdelivr/cdnjs. */
+function loadScript(urls, cb){
+  var i=0;
+  function tryNext(){
+    if(i>=urls.length){ cb(new Error("all CDNs failed for "+urls[0])); return; }
+    var sc=document.createElement('script');
+    sc.src=urls[i++];
+    sc.crossOrigin="anonymous";
+    sc.onload=function(){ cb(null); };
+    sc.onerror=function(){ tryNext(); };
+    document.head.appendChild(sc);
+  }
+  tryNext();
+}
+window.__cardexReady=new Promise(function(resolve,reject){
+  loadScript([
+    "https://unpkg.com/react@18/umd/react.production.min.js",
+    "https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"
+  ], function(e){
+    if(e){reject(e);return;}
+    loadScript([
+      "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js",
+      "https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js",
+      "https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"
+    ], function(e2){
+      if(e2){reject(e2);return;}
+      loadScript([
+        "https://unpkg.com/@babel/standalone/babel.min.js",
+        "https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js",
+        "https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"
+      ], function(e3){ if(e3){reject(e3);return;} resolve(); });
+    });
+  });
+});
+</script>
 <style>
   *{box-sizing:border-box}
   html,body{margin:0;background:#0a0c0f;color:#eaf0f6;font-family:Inter,system-ui,sans-serif}
@@ -420,25 +454,24 @@ ReactDOM.createRoot(document.getElementById("root")).render(<ErrorBoundary><App/
 </script>
 <script>
 (function(){
+  function fail(msg){ var b=document.getElementById('errbox'); if(b){b.style.display='block';b.textContent=msg;} }
   function run(){
     try{
       var src = document.getElementById('cardex-src').textContent;
       var out = Babel.transform(src, { presets: ['react'] }).code;
       var s = document.createElement('script');
-      s.type = 'text/javascript';            // CLASSIC script, never a module
+      s.type = 'text/javascript';
       s.text = out;
       document.body.appendChild(s);
-    }catch(e){
-      var b=document.getElementById('errbox');
-      if(b){b.style.display='block';b.textContent='COMPILE ERROR:\n\n'+(e.message||e);}
-    }
+    }catch(e){ fail('COMPILE ERROR:\n\n'+(e.stack||e.message||e)); }
   }
-  // wait until Babel is available
-  (function wait(n){
-    if(window.Babel){ run(); }
-    else if(n>0){ setTimeout(function(){wait(n-1);}, 100); }
-    else { var b=document.getElementById('errbox'); if(b){b.style.display='block';b.textContent='Babel failed to load from CDN.';} }
-  })(50);
+  if(window.__cardexReady){
+    window.__cardexReady.then(run).catch(function(e){
+      fail('Failed to load React/Babel from any CDN.\nCheck your internet connection, then reload.\n\n'+(e&&e.message||e));
+    });
+  } else {
+    fail('Loader did not initialise.');
+  }
 })();
 </script>
 </body>
