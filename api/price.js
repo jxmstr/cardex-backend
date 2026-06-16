@@ -1,12 +1,11 @@
 // api/price.js — Vercel serverless function
-// Holds your eBay key (env vars) and returns card pricing from the eBay
-// Browse API (current live listings), with tighter matching + outlier trimming
-// so one absurd listing can't distort the price.
+// eBay Browse API (live listings), strict-matched to the card ID, then
+// BUCKETED BY GRADE so each grade has its own honest price (Raw / PSA 9 /
+// PSA 10 / BGS / CGC etc.) instead of one blended, meaningless number.
 //
-//   GET /api/price?q=Monkey.D.Luffy OP01-060&grade=PSA 10&market=us
+//   GET /api/price?q=Shanks OP01-120&market=us
 //
-// Env vars (set in Vercel, never in code):
-//   EBAY_CLIENT_ID, EBAY_CLIENT_SECRET
+// Env vars (set in Vercel): EBAY_CLIENT_ID, EBAY_CLIENT_SECRET
 
 let cachedToken = null;
 let tokenExpiry = 0;
@@ -32,22 +31,29 @@ async function getToken() {
 
 const MARKETPLACE = { us: "EBAY_US", uk: "EBAY_GB" };
 
-// trimmed stats: drop the cheapest/most-expensive 10% before averaging,
-// so a single junk listing can't wreck the numbers
-function robustStats(prices, currency) {
+// Classify a listing title into a grade bucket.
+function gradeOf(title) {
+  const t = (title || "").toUpperCase();
+  // look for "PSA 10", "BGS 9.5", "CGC 9", etc.
+  const m = t.match(/\b(PSA|BGS|CGC|SGC)\s?(10|9\.5|9|8\.5|8|7|6|5)\b/);
+  if (m) return `${m[1]} ${m[2]}`;
+  if (/\b(PSA|BGS|CGC|SGC|GRADED|GEM\s?MINT)\b/.test(t)) return "Graded (other)";
+  return "Raw";
+}
+
+function statsOf(prices, currency) {
   if (!prices.length) return null;
   const sorted = [...prices].sort((a, b) => a - b);
   const cut = Math.floor(sorted.length * 0.1);
   const trimmed = sorted.slice(cut, sorted.length - cut || sorted.length);
   const arr = trimmed.length ? trimmed : sorted;
-  const median = sorted[Math.floor(sorted.length / 2)];
   return {
     count: sorted.length,
     currency,
     low: sorted[0],
     high: sorted[sorted.length - 1],
-    median,
-    avg: +(arr.reduce((s, n) => s + n, 0) / arr.length).toFixed(2), // trimmed mean
+    median: sorted[Math.floor(sorted.length / 2)],
+    avg: +(arr.reduce((s, n) => s + n, 0) / arr.length).toFixed(2),
   };
 }
 
@@ -57,23 +63,19 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
 
   try {
-    const { q = "", grade = "", market = "us" } = req.query;
+    const { q = "", market = "us" } = req.query;
     if (!q) return res.status(400).json({ error: "Missing q (search query)" });
 
     const token = await getToken();
     const region = MARKETPLACE[String(market).toLowerCase()] || "EBAY_US";
 
-    // Pull the card ID out of the query (e.g. "OP01-060") to filter strictly.
     const idMatch = q.match(/\b([A-Z]{2,4}\d{2}-\d{3})\b/i);
     const cardId = idMatch ? idMatch[1].toUpperCase() : null;
 
-    const term = `${q} ${grade}`.trim();
     const url =
       "https://api.ebay.com/buy/browse/v1/item_summary/search" +
-      `?q=${encodeURIComponent(term)}` +
-      `&category_ids=183454` +
-      `&limit=100` +
-      `&filter=buyingOptions:{FIXED_PRICE}`;
+      `?q=${encodeURIComponent(q)}` +
+      `&category_ids=183454&limit=100&filter=buyingOptions:{FIXED_PRICE}`;
 
     const r = await fetch(url, {
       headers: {
@@ -87,63 +89,66 @@ export default async function handler(req, res) {
     const data = await r.json();
     let items = data.itemSummaries || [];
 
-    // STRICT MATCH. Priority:
-    //  1) listings whose title contains the exact card ID  → best
-    //  2) else listings containing all significant name words → good
-    //  3) else keep nothing rather than show wrong cards     → honest
+    // STRICT: keep only listings whose title contains the exact card ID;
+    // else require all name words; else nothing (honest, no wrong cards).
     const nameOnly = q.replace(/\b[A-Z]{2,4}\d{2}-\d{3}\b/i, "").trim();
     const nameWords = nameOnly.split(/[^A-Za-z]+/).filter((w) => w.length >= 3);
-
     if (cardId) {
-      const idLoose = cardId.replace("-", "[- ]?");
-      const reId = new RegExp(idLoose, "i");
+      const reId = new RegExp(cardId.replace("-", "[- ]?"), "i");
       const byId = items.filter((it) => reId.test(it.title || ""));
-      if (byId.length >= 1) {
-        items = byId;                       // any exact-ID match wins
-      } else if (nameWords.length) {
-        // fall back to NAME match (all words present), not loose keyword soup
-        const byName = items.filter((it) =>
+      if (byId.length >= 1) items = byId;
+      else if (nameWords.length)
+        items = items.filter((it) =>
           nameWords.every((w) => new RegExp("\\b" + w, "i").test(it.title || ""))
         );
-        items = byName; // may be empty → we report "no clean matches" honestly
-      }
     }
-
-    // If a grade was requested, prefer listings that mention it
-    if (grade && grade.toLowerCase() !== "raw") {
-      const g = grade.replace(/\s+/g, "\\s*");
-      const re = new RegExp(g, "i");
-      const graded = items.filter((it) => re.test(it.title || ""));
-      if (graded.length >= 3) items = graded;
-    } else if (grade.toLowerCase() === "raw") {
-      // exclude obviously graded listings for a "raw" lookup
-      items = items.filter((it) => !/\b(PSA|BGS|CGC|graded)\b/i.test(it.title || ""));
-    }
-
-    const prices = items
-      .map((it) => parseFloat(it.price?.value))
-      .filter((n) => !isNaN(n) && n > 0);
 
     const currency = items[0]?.price?.currency || (region === "EBAY_GB" ? "GBP" : "USD");
-    const stats = robustStats(prices, currency);
 
-    const listings = items.slice(0, 15).map((it) => ({
-      title: it.title,
-      price: parseFloat(it.price?.value),
-      currency: it.price?.currency,
-      condition: it.condition || "—",
-      url: it.itemWebUrl,
-      image: it.image?.imageUrl || it.thumbnailImages?.[0]?.imageUrl || null,
-      seller: it.seller?.username || "—",
-    }));
+    // BUCKET BY GRADE
+    const buckets = {};
+    const listings = [];
+    for (const it of items) {
+      const price = parseFloat(it.price?.value);
+      if (isNaN(price) || price <= 0) continue;
+      const g = gradeOf(it.title);
+      (buckets[g] = buckets[g] || []).push(price);
+      listings.push({
+        title: it.title,
+        price,
+        currency: it.price?.currency,
+        grade: g,
+        condition: it.condition || "—",
+        url: it.itemWebUrl,
+        image: it.image?.imageUrl || it.thumbnailImages?.[0]?.imageUrl || null,
+        seller: it.seller?.username || "—",
+      });
+    }
+
+    // ordered grade list for display
+    const ORDER = ["Raw", "PSA 9", "PSA 10", "BGS 9", "BGS 9.5", "BGS 10", "CGC 9", "CGC 9.5", "CGC 10", "Graded (other)"];
+    const byGrade = Object.keys(buckets)
+      .sort((a, b) => {
+        const ia = ORDER.indexOf(a), ib = ORDER.indexOf(b);
+        return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+      })
+      .map((g) => ({ grade: g, ...statsOf(buckets[g], currency) }));
+
+    // overall raw stats (most useful single number = the Raw bucket if present)
+    const overall = buckets["Raw"] ? statsOf(buckets["Raw"], currency) : statsOf(
+      Object.values(buckets).flat(), currency
+    );
+
+    listings.sort((a, b) => a.price - b.price);
 
     return res.status(200).json({
-      query: term,
+      query: q,
       cardId,
       market: region,
-      stats,
-      listings,
-      note: "Live eBay listings (Browse API), strict-matched to the card ID with outlier trimming. Sold prices require Marketplace Insights API.",
+      stats: overall,        // headline number (Raw if available)
+      byGrade,               // per-grade breakdown
+      listings: listings.slice(0, 20),
+      note: "Live eBay listings (Browse API), strict-matched to card ID and bucketed by grade. Sold prices require Marketplace Insights API.",
     });
   } catch (err) {
     return res.status(500).json({ error: String(err.message || err) });
