@@ -87,13 +87,26 @@ export default async function handler(req, res) {
     const data = await r.json();
     let items = data.itemSummaries || [];
 
-    // STRICT MATCH: if we know the card ID, keep only listings whose title
-    // actually contains that exact ID. This removes the wrong-card noise.
+    // STRICT MATCH. Priority:
+    //  1) listings whose title contains the exact card ID  → best
+    //  2) else listings containing all significant name words → good
+    //  3) else keep nothing rather than show wrong cards     → honest
+    const nameOnly = q.replace(/\b[A-Z]{2,4}\d{2}-\d{3}\b/i, "").trim();
+    const nameWords = nameOnly.split(/[^A-Za-z]+/).filter((w) => w.length >= 3);
+
     if (cardId) {
-      const idLoose = cardId.replace("-", "[- ]?"); // tolerate "OP01 060" / "OP01060"
-      const re = new RegExp(idLoose, "i");
-      const strict = items.filter((it) => re.test(it.title || ""));
-      if (strict.length >= 3) items = strict; // only apply if it leaves enough data
+      const idLoose = cardId.replace("-", "[- ]?");
+      const reId = new RegExp(idLoose, "i");
+      const byId = items.filter((it) => reId.test(it.title || ""));
+      if (byId.length >= 1) {
+        items = byId;                       // any exact-ID match wins
+      } else if (nameWords.length) {
+        // fall back to NAME match (all words present), not loose keyword soup
+        const byName = items.filter((it) =>
+          nameWords.every((w) => new RegExp("\\b" + w, "i").test(it.title || ""))
+        );
+        items = byName; // may be empty → we report "no clean matches" honestly
+      }
     }
 
     // If a grade was requested, prefer listings that mention it
